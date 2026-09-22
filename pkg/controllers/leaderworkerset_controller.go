@@ -76,6 +76,13 @@ const (
 	GroupsUpdating    = "GroupsUpdating"
 	CreatingRevision  = "CreatingRevision"
 	FailedUpdate      = "FailedUpdate"
+	// Group replacement event reasons, emitted by the pod controller when a
+	// gated hash-identity leader is held back or admitted for scheduling.
+	GroupReplacementDeferred = "GroupReplacementDeferred"
+	GroupReplacementAdmitted = "GroupReplacementAdmitted"
+
+	// UnexpectedPodGroupOwner indicates that PodGroup ownership prevents reconciliation.
+	UnexpectedPodGroupOwner = "UnexpectedPodGroupOwner"
 
 	// Event actions
 	Create = "Create"

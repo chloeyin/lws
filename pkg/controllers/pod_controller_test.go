@@ -18,7 +18,11 @@ package controllers
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	appsv1 "k8s.io/api/apps/v1"
@@ -32,15 +36,99 @@ import (
 	appsapplyv1 "k8s.io/client-go/applyconfigurations/apps/v1"
 	coreapplyv1 "k8s.io/client-go/applyconfigurations/core/v1"
 	metaapplyv1 "k8s.io/client-go/applyconfigurations/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	leaderworkerset "sigs.k8s.io/lws/api/leaderworkerset/v1"
+	"sigs.k8s.io/lws/pkg/schedulerprovider"
+	podutils "sigs.k8s.io/lws/pkg/utils/pod"
 	revisionutils "sigs.k8s.io/lws/pkg/utils/revision"
 	"sigs.k8s.io/lws/test/wrappers"
 )
+
+type stubSchedulerProvider struct {
+	createErr error
+	calls     int
+}
+
+func (s *stubSchedulerProvider) CreatePodGroupIfNotExists(context.Context, *leaderworkerset.LeaderWorkerSet, *corev1.Pod) error {
+	s.calls++
+	return s.createErr
+}
+
+func (*stubSchedulerProvider) InjectPodGroupMetadata(*corev1.Pod) error {
+	return nil
+}
+
+func TestPodReconcilerReturnsPodGroupErrors(t *testing.T) {
+	testScheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(testScheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := leaderworkerset.AddToScheme(testScheme); err != nil {
+		t.Fatal(err)
+	}
+
+	lws := &leaderworkerset.LeaderWorkerSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-lws", Namespace: "default"},
+		Spec: leaderworkerset.LeaderWorkerSetSpec{
+			LeaderWorkerTemplate: leaderworkerset.LeaderWorkerTemplate{Size: ptr.To[int32](1)},
+		},
+	}
+	leaderPod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-lws-0",
+			Namespace: lws.Namespace,
+			Labels: map[string]string{
+				leaderworkerset.SetNameLabelKey:     lws.Name,
+				leaderworkerset.WorkerIndexLabelKey: "0",
+			},
+		},
+	}
+	for _, tc := range []struct {
+		name      string
+		err       error
+		wantEvent bool
+	}{
+		{name: "waiting for garbage collection", err: errors.New("waiting for podgroup deletion")},
+		{name: "unexpected owner", err: fmt.Errorf("%w: conflicting owner", schedulerprovider.ErrUnexpectedPodGroupOwner), wantEvent: true},
+		{name: "API failure", err: errors.New("API unavailable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &stubSchedulerProvider{createErr: tc.err}
+			recorder := events.NewFakeRecorder(1)
+			reconciler := &PodReconciler{
+				Client:            fake.NewClientBuilder().WithScheme(testScheme).WithObjects(lws, leaderPod).Build(),
+				Scheme:            testScheme,
+				SchedulerProvider: provider,
+				Record:            recorder,
+			}
+			result, err := reconciler.reconcilePod(context.Background(), podReconcileRequestForPod(leaderPod, false))
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("reconcilePod() error = %v, want %v", err, tc.err)
+			}
+			if !result.IsZero() {
+				t.Fatalf("expected error-based retry without explicit requeue, got %+v", result)
+			}
+			if provider.calls != 1 {
+				t.Fatalf("provider calls = %d, want 1", provider.calls)
+			}
+			select {
+			case event := <-recorder.Events:
+				if !tc.wantEvent || !strings.Contains(event, "Warning UnexpectedPodGroupOwner") || !strings.Contains(event, tc.err.Error()) {
+					t.Fatalf("unexpected event: %s", event)
+				}
+			default:
+				if tc.wantEvent {
+					t.Fatal("expected unexpected-owner warning event")
+				}
+			}
+		})
+	}
+}
 
 func TestConstructWorkerStatefulSetApplyConfiguration(t *testing.T) {
 	client := fake.NewClientBuilder().Build()
@@ -920,5 +1008,162 @@ func TestConstructWorkerStatefulSetServiceNameHashUniquePerReplica(t *testing.T)
 	}
 	if got := *cfg.Spec.ServiceName; got != "test-sample-9f2ac71b" {
 		t.Errorf("expected the worker StatefulSet to use the group key derived service name, got %q", got)
+	}
+}
+
+func TestReconcileGroupReplacementGate(t *testing.T) {
+	lws := wrappers.BuildLeaderWorkerSet("default").Replica(2).Size(2).Obj()
+	lws.Spec.GroupIdentity = leaderworkerset.GroupIdentityHash
+
+	base := time.Now()
+	leader := func(name string, createdOffset time.Duration, gated, terminating bool) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              name,
+				Namespace:         lws.Namespace,
+				CreationTimestamp: metav1.NewTime(base.Add(createdOffset)),
+				Labels: map[string]string{
+					leaderworkerset.SetNameLabelKey:     lws.Name,
+					leaderworkerset.WorkerIndexLabelKey: "0",
+					leaderworkerset.GroupIndexLabelKey:  name,
+				},
+			},
+		}
+		if gated {
+			p.Spec.SchedulingGates = []corev1.PodSchedulingGate{{Name: leaderworkerset.GroupReplacementSchedulingGate}}
+		}
+		if terminating {
+			now := metav1.Now()
+			p.DeletionTimestamp = &now
+			p.Finalizers = []string{"foregroundDeletion"}
+		}
+		return p
+	}
+	// worker builds a worker pod of the group led by leaderName. A rolling
+	// update or scale down deletes the leader in the background, so the leader
+	// object can be gone while its workers still hold capacity.
+	worker := func(leaderName string, terminating bool) *corev1.Pod {
+		p := &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:              leaderName + "-1",
+				Namespace:         lws.Namespace,
+				CreationTimestamp: metav1.NewTime(base.Add(-time.Minute)),
+				Labels: map[string]string{
+					leaderworkerset.SetNameLabelKey:     lws.Name,
+					leaderworkerset.WorkerIndexLabelKey: "1",
+					leaderworkerset.GroupIndexLabelKey:  leaderName,
+				},
+			},
+		}
+		if terminating {
+			now := metav1.Now()
+			p.DeletionTimestamp = &now
+			p.Finalizers = []string{"test/hold"}
+		}
+		return p
+	}
+
+	tests := []struct {
+		name         string
+		policy       leaderworkerset.GroupReplacementPolicyType
+		pods         []*corev1.Pod
+		reconciled   string
+		wantAdmitted bool
+	}{
+		{
+			name:         "immediate policy lifts the gate while a group is still terminating",
+			policy:       leaderworkerset.GroupReplacementImmediate,
+			pods:         []*corev1.Pod{leader("new", 0, true, false), leader("old", -time.Minute, false, true)},
+			reconciled:   "new",
+			wantAdmitted: true,
+		},
+		{
+			name:         "no terminating groups admits the gated leader",
+			policy:       leaderworkerset.GroupReplacementPostTermination,
+			pods:         []*corev1.Pod{leader("new", 0, true, false), leader("running", -time.Minute, false, false)},
+			reconciled:   "new",
+			wantAdmitted: true,
+		},
+		{
+			name:         "a terminating group holds back the only gated leader",
+			policy:       leaderworkerset.GroupReplacementPostTermination,
+			pods:         []*corev1.Pod{leader("new", 0, true, false), leader("old", -time.Minute, false, true)},
+			reconciled:   "new",
+			wantAdmitted: false,
+		},
+		{
+			name:         "oldest gated leader takes the free slot",
+			policy:       leaderworkerset.GroupReplacementPostTermination,
+			pods:         []*corev1.Pod{leader("first", 0, true, false), leader("second", time.Second, true, false), leader("old", -time.Minute, false, true)},
+			reconciled:   "first",
+			wantAdmitted: true,
+		},
+		{
+			name:         "newest gated leader waits when only one slot is free",
+			policy:       leaderworkerset.GroupReplacementPostTermination,
+			pods:         []*corev1.Pod{leader("first", 0, true, false), leader("second", time.Second, true, false), leader("old", -time.Minute, false, true)},
+			reconciled:   "second",
+			wantAdmitted: false,
+		},
+		{
+			name:         "two terminating groups hold back two gated leaders",
+			policy:       leaderworkerset.GroupReplacementPostTermination,
+			pods:         []*corev1.Pod{leader("first", 0, true, false), leader("second", time.Second, true, false), leader("old-a", -time.Minute, false, true), leader("old-b", -time.Minute, false, true)},
+			reconciled:   "first",
+			wantAdmitted: false,
+		},
+		{
+			name:         "a leader that is already gone still holds while its worker exists",
+			policy:       leaderworkerset.GroupReplacementPostTermination,
+			pods:         []*corev1.Pod{leader("new", 0, true, false), worker("old", true)},
+			reconciled:   "new",
+			wantAdmitted: false,
+		},
+		{
+			name:         "a terminating leader and its worker count as one group",
+			policy:       leaderworkerset.GroupReplacementPostTermination,
+			pods:         []*corev1.Pod{leader("first", 0, true, false), leader("second", time.Second, true, false), leader("old", -time.Minute, false, true), worker("old", true)},
+			reconciled:   "first",
+			wantAdmitted: true,
+		},
+		{
+			name:         "a terminating worker under a live leader is not a tearing down group",
+			policy:       leaderworkerset.GroupReplacementPostTermination,
+			pods:         []*corev1.Pod{leader("new", 0, true, false), leader("running", -time.Minute, false, false), worker("running", true)},
+			reconciled:   "new",
+			wantAdmitted: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			objs := make([]client.Object, 0, len(tc.pods))
+			for _, p := range tc.pods {
+				objs = append(objs, p)
+			}
+			fakeClient := fake.NewClientBuilder().WithObjects(objs...).Build()
+			reconciler := PodReconciler{Client: fakeClient, Record: fakeEventRecorder{}}
+			testLws := lws.DeepCopy()
+			testLws.Spec.GroupReplacementPolicy = tc.policy
+
+			var pod corev1.Pod
+			if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: lws.Namespace, Name: tc.reconciled}, &pod); err != nil {
+				t.Fatalf("getting reconciled pod: %v", err)
+			}
+			admitted, err := reconciler.reconcileGroupReplacementGate(context.Background(), &pod, testLws)
+			if err != nil {
+				t.Fatalf("reconcileGroupReplacementGate() error = %v", err)
+			}
+			if admitted != tc.wantAdmitted {
+				t.Fatalf("reconcileGroupReplacementGate() admitted = %t, want %t", admitted, tc.wantAdmitted)
+			}
+			var stored corev1.Pod
+			if err := fakeClient.Get(context.Background(), types.NamespacedName{Namespace: lws.Namespace, Name: tc.reconciled}, &stored); err != nil {
+				t.Fatalf("getting stored pod: %v", err)
+			}
+			if gated := podutils.HasSchedulingGate(&stored, leaderworkerset.GroupReplacementSchedulingGate); gated == tc.wantAdmitted {
+				t.Errorf("stored pod gated = %t, want %t", gated, !tc.wantAdmitted)
+			}
+		})
 	}
 }
